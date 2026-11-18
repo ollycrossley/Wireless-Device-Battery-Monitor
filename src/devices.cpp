@@ -46,6 +46,7 @@ std::vector<DeviceStatus> PollAllDevices() {
                             return std::find(ignored.begin(), ignored.end(), std::make_pair(c.vid, c.pid)) != ignored.end();
                         }),
                         ctx.colls.end());
+    PollNuPhy(ctx);
     PollGlorious(ctx);
     PollAula(ctx);       // before Kysona, which shares the 3554 vendor id and would probe it first
     PollDareu(ctx);

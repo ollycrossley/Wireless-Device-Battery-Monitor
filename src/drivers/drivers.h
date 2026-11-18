@@ -57,6 +57,7 @@ void PollDarmoshark(PollContext& ctx); // Darmoshark M3 over its 2.4 GHz receive
 void PollAtkSerial(PollContext& ctx); // ATK N9 Pro / N9 Ultra headsets (virtual COM port)
 void PollKeychron(PollContext& ctx);  // Keychron mice, Nape Pro trackball (Link-KM receiver)
 void PollCherry(PollContext& ctx);    // CHERRY MX 3.0S Wireless on its 2.4 GHz dongle (046A:00EA) or USB cable (046A:00E3)
+void PollNuPhy(PollContext& ctx);    // Halo96 V2 with custom battery telemetry over the stock receiver
 void PollArbiter(PollContext& ctx);   // Arbiter Studio Akitsu mice on 373E (before Lamzu, same vendor id)
 void PollLamzu(PollContext& ctx);     // LAMZU mice on vendor ids 373E / 37B0
 void PollEndgame(PollContext& ctx);   // Endgame Gear 4K mice (OP1w 4k, XM2w 4k) on the 4K dongle
