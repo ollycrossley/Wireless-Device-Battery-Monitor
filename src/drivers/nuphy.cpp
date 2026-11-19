@@ -1,123 +1,48 @@
-// NuPhy Halo96 V2 with custom battery firmware. Protocol and hardware evidence
-// are in docs/nuphy-halo96-v2.md. The stock receiver forwards the reports.
+// NuPhy WH80 over USB (19F5:A011), hardware-tested.
+// Source: https://drive.nuphy.io/static/js/main.b3fb29e0.js, NuPhyIO SDK
+// getBatteryState(0): GetFunc (05), offset 0020, one byte. Only this GET is sent.
+// Unnumbered 64-byte reports on usage 0001:0000, interface 1:
+//   55 05 00 21 01 20 00 00 ... -> AA 05 00 checksum 01 20 00 00 value ...
+// Checksum is the low byte of the sum of bytes 4..63. Value: bit 7 charging,
+// bits 0..6 percentage (WH80 reports in 10% steps). Bluetooth/receiver untested.
 #include "drivers.h"
-#include "nuphy_protocol.h"
-
-#include <map>
-#include <memory>
 
 namespace {
-
-constexpr USHORT kVendor = 0x19f5, kProduct = 0x3247;
-constexpr DWORD kReadTimeoutMs = 250;
-constexpr ULONGLONG kSampleLifetimeMs = 35000;  // Firmware sends a frame about every 15 seconds.
-
-class Receiver {
-public:
-    explicit Receiver(const HidColl& collection) : collection_(collection) {
-        if (stop_) thread_ = CreateThread(nullptr, 0, Listen, this, 0, nullptr);
-    }
-
-    ~Receiver() {
-        if (thread_) {
-            SetEvent(stop_);
-            WaitForSingleObject(thread_, INFINITE);
-            CloseHandle(thread_);
-        }
-        if (stop_) CloseHandle(stop_);
-    }
-
-    bool Running() const { return thread_ != nullptr; }
-
-    int Percent() {
-        AcquireSRWLockShared(&lock_);
-        const int percent = GetTickCount64() - receivedMs_ <= kSampleLifetimeMs ? percent_ : -1;
-        ReleaseSRWLockShared(&lock_);
-        return percent;
-    }
-
-private:
-    static DWORD WINAPI Listen(LPVOID arg) {
-        static_cast<Receiver*>(arg)->ReadReports();
-        return 0;
-    }
-
-    void UpdateSample(int percent, ULONGLONG now) {
-        AcquireSRWLockExclusive(&lock_);
-        percent_ = percent;
-        receivedMs_ = now;
-        ReleaseSRWLockExclusive(&lock_);
-    }
-
-    void ReadReports() {
-        HidDev device;
-        nuphy::BatteryFrame frame;
-        std::vector<BYTE> report;
-        while (WaitForSingleObject(stop_, 0) == WAIT_TIMEOUT) {
-            if (!device.ok() && !device.OpenReadOnly(collection_)) {
-                if (WaitForSingleObject(stop_, kReadTimeoutMs) != WAIT_TIMEOUT) break;
-                continue;
-            }
-
-            const ULONGLONG started = GetTickCount64();
-            const int count = device.Read(report, kReadTimeoutMs);
-            const ULONGLONG now = GetTickCount64();
-            if (count < 0) {
-                // A rapid failure means the handle may have been invalidated by a USB reconnect.
-                // An ordinary read timeout leaves the stream open.
-                if (now - started < kReadTimeoutMs / 2) {
-                    device.Close();
-                    frame = {};
-                    UpdateSample(-1, now);
-                    if (WaitForSingleObject(stop_, kReadTimeoutMs) != WAIT_TIMEOUT) break;
-                }
-                continue;
-            }
-            const int percent = frame.Consume(report.data(), report.size(), now);
-            if (percent >= 0) UpdateSample(percent, now);
-        }
-    }
-
-    HidColl collection_;
-    HANDLE stop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    HANDLE thread_ = nullptr;
-    SRWLOCK lock_ = SRWLOCK_INIT;
-    int percent_ = -1;
-    ULONGLONG receivedMs_ = 0;
-};
-
+bool BatteryReply(const std::vector<BYTE>& r, int& percent, bool& charging) {
+    if (r.size() != 64 || r[0] != 0xAA || r[1] != 0x05 || r[2] != 0 || r[4] != 1 ||
+        r[5] != 0x20 || r[6] != 0 || r[7] != 0) return false;
+    unsigned sum = 0;
+    for (size_t i = 4; i < r.size(); ++i) sum += r[i];
+    if ((sum & 0xFF) != r[3] || (r[8] & 0x7F) > 100) return false;
+    percent = r[8] & 0x7F;
+    charging = (r[8] & 0x80) != 0;
+    return true;
+}
 }  // namespace
 
-void PollNuPhy(PollContext& ctx) {
-    // The receiving thread preserves the timing of the burst without making the
-    // normal poll wait for the next 15-second broadcast, including on stock firmware.
-    static std::map<std::wstring, std::unique_ptr<Receiver>> receivers;
-    std::set<std::wstring> present;
-    for (const auto* c : ctx.Find(kVendor, kProduct, [](const HidColl& c) {
-             return c.iface == 1 && c.page() == 0x000c && c.usage() == 0x0001 && c.inLen() == 3;
-         })) {
-        auto it = receivers.find(c->path);
-        if (it == receivers.end()) {
-            // Other NuPhy models share this receiver VID/PID.
-            if (HidProduct(*c) != L"NuPhy Halo96 V2 Dongle") continue;
-            auto receiver = std::make_unique<Receiver>(*c);
-            if (!receiver->Running()) continue;
-            it = receivers.emplace(c->path, std::move(receiver)).first;
+void PollNuphy(PollContext& ctx) {
+    constexpr USHORT vid = 0x19F5, pid = 0xA011;
+    if (ctx.IsClaimed(vid, pid)) return;
+    for (const HidColl* c : ctx.Find(vid, pid, [](const HidColl& c) {
+        return c.iface == 1 && c.page() == 1 && c.usage() == 0 && c.inLen() == 65 && c.outLen() == 65;
+    })) {
+        HidDev d;
+        if (!d.Open(*c)) continue;
+        d.Flush();
+        if (!d.Write({ 0, 0x55, 0x05, 0, 0x21, 1, 0x20, 0, 0 }, 400)) continue;
+        const ULONGLONG end = GetTickCount64() + 400;
+        for (;;) {
+            int left = (int)((LONGLONG)end - (LONGLONG)GetTickCount64());
+            std::vector<BYTE> r;
+            if (left <= 0 || d.Read(r, left) < 0) break;
+            DeviceStatus s;
+            if (!BatteryReply(r, s.percent, s.charging)) continue;
+            s.key = L"nuphy:WH80";
+            s.name = L"NuPhy WH80";
+            s.kind = DeviceKind::Keyboard;
+            s.via = L"USB cable";
+            ctx.Add(s, vid, pid);
+            return;
         }
-        present.insert(c->path);
-
-        const int percent = it->second->Percent();
-        if (percent < 0) continue;
-        DeviceStatus status;
-        status.key = L"nuphy:" + c->path;
-        status.name = L"NuPhy Halo96 V2";
-        status.via = L"2.4 GHz receiver";
-        status.kind = DeviceKind::Keyboard;
-        status.percent = percent;
-        ctx.Add(status, kVendor, kProduct);
-    }
-    for (auto it = receivers.begin(); it != receivers.end();) {
-        if (present.count(it->first)) ++it;
-        else it = receivers.erase(it);
     }
 }
