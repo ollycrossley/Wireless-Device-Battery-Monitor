@@ -119,11 +119,10 @@ int RunApplyMode(int argc, wchar_t** argv) {
     i18n::Init();  // the helper runs before the normal startup, so its messages need the language too
     std::wstring installer = argv[2], target = argv[5], self = ExecutablePath();
     auto slash = self.find_last_of(L'\\');
-    wchar_t temporary[32768];
-    DWORD n = GetTempPathW(ARRAYSIZE(temporary), temporary);
-    if (!n || n >= ARRAYSIZE(temporary) || slash == std::wstring::npos) return 2;
+    std::wstring root = DownloadRoot();
+    if (root.empty() || slash == std::wstring::npos) return 2;
     std::wstring directory = self.substr(0, slash);
-    std::wstring prefix = std::wstring(temporary) + L"WirelessBattery-update-";
+    std::wstring prefix = root + L"\\";  // the helper only runs from its own download folder
     if (directory.compare(0, prefix.size(), prefix) != 0 || directory.size() != prefix.size() + 32 ||
         installer != directory + L"\\update-setup.exe" || self != directory + L"\\update-helper.exe") return 2;
     for (size_t i = prefix.size(); i < directory.size(); ++i)

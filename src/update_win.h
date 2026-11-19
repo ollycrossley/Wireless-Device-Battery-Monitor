@@ -25,4 +25,7 @@ struct Installation {
 Installation FindInstallation(const std::wstring& executable);
 std::wstring ExecutablePath();
 bool VerifyFile(const std::wstring& file, const std::string& expectedSha256, std::uint64_t expectedSize);
+// The app's own update folder, %LOCALAPPDATA%\WirelessBattery\updates (created when missing), or empty when it
+// is unavailable or a reparse point. Each download gets a random 32-hex-digit subfolder there.
+std::wstring DownloadRoot();
 }

@@ -187,19 +187,18 @@ void SaveKnown() {
 
 void ShowAvailable(HWND owner);
 
-void CleanOldDownloads() {
-    wchar_t temporary[32768];
-    DWORD length = GetTempPathW(ARRAYSIZE(temporary), temporary);
-    if (!length || length >= ARRAYSIZE(temporary)) return;
-    std::wstring root(temporary);
+// Removes this app's download folders (`prefix` + 32 hex digits) in `root` that are over a day old.
+void CleanDownloadsIn(const std::wstring& root, const std::wstring& prefix) {
+    if (root.empty()) return;
     WIN32_FIND_DATAW entry;
-    HANDLE search = FindFirstFileW((root + L"WirelessBattery-update-*").c_str(), &entry);
+    HANDLE search = FindFirstFileW((root + prefix + L"*").c_str(), &entry);
     if (search == INVALID_HANDLE_VALUE) return;
     do {
         std::wstring name(entry.cFileName);
-        if (!(entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) || name.size() != 55) continue;
+        if (!(entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+            name.size() != prefix.size() + 32 || name.compare(0, prefix.size(), prefix) != 0) continue;
         bool hex = true;
-        for (size_t i = 23; i < name.size(); ++i)
+        for (size_t i = prefix.size(); i < name.size(); ++i)
             hex &= (name[i] >= L'0' && name[i] <= L'9') || (name[i] >= L'a' && name[i] <= L'f');
         ULARGE_INTEGER written;
         written.LowPart = entry.ftLastWriteTime.dwLowDateTime;
@@ -212,6 +211,15 @@ void CleanOldDownloads() {
         RemoveDirectoryW(directory.c_str()); // Non-recursive; unknown files keep the directory intact.
     } while (FindNextFileW(search, &entry));
     FindClose(search);
+}
+
+void CleanOldDownloads() {
+    auto root = DownloadRoot();
+    if (!root.empty()) CleanDownloadsIn(root + L"\\", L"");
+    // Version 1.1.0 downloaded to %TEMP%\WirelessBattery-update-<hex>; remove what it left behind.
+    wchar_t temporary[32768];
+    DWORD length = GetTempPathW(ARRAYSIZE(temporary), temporary);
+    if (length && length < ARRAYSIZE(temporary)) CleanDownloadsIn(temporary, L"WirelessBattery-update-");
 }
 }
 
@@ -311,6 +319,21 @@ void Activate(HWND owner) {
     StartCheck(true);
 }
 
+std::wstring DownloadRoot() {
+    wchar_t local[32768];
+    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", local, ARRAYSIZE(local));
+    if (!n || n >= ARRAYSIZE(local)) return {};
+    std::wstring folder = std::wstring(local) + L"\\WirelessBattery";
+    for (const wchar_t* part : { L"", L"\\updates" }) {
+        folder += part;
+        if (!CreateDirectoryW(folder.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return {};
+        DWORD attributes = GetFileAttributesW(folder.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY) ||
+            (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return {};
+    }
+    return folder;
+}
+
 std::wstring ExecutablePath() {
     std::vector<wchar_t> path(32768);
     DWORD n = GetModuleFileNameW(nullptr, path.data(), (DWORD)path.size());
@@ -332,12 +355,11 @@ std::wstring CanonicalDirectory(const std::wstring& directory) {
 }
 
 std::wstring NewDownloadDirectory() {
-    wchar_t temp[32768];
-    DWORD length = GetTempPathW(ARRAYSIZE(temp), temp);
-    if (!length || length >= ARRAYSIZE(temp)) return {};
+    std::wstring root = DownloadRoot();
+    if (root.empty()) return {};
     unsigned char bytes[16];
     if (BCryptGenRandom(nullptr, bytes, sizeof(bytes), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) return {};
-    std::wstring directory = std::wstring(temp) + L"WirelessBattery-update-";
+    std::wstring directory = root + L"\\";
     for (auto b : bytes) { directory += L"0123456789abcdef"[b >> 4]; directory += L"0123456789abcdef"[b & 15]; }
     return CreateDirectoryW(directory.c_str(), nullptr) ? directory : L"";
 }
