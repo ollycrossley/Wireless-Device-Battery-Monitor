@@ -1,6 +1,6 @@
 # NuPhy Halo96 V2 over 2.4 GHz
 
-This driver requires the [custom Halo96 V2 QMK/VIA ANSI firmware (v0.1.0)](https://github.com/ollycrossley/nuphy-custom-firmware/releases/tag/v0.1.0). The release includes the prebuilt `.bin`. The original NuPhy receiver forwards the reports. With the stock keyboard firmware, use the app's Bluetooth battery support.
+This driver requires the custom Halo96 V2 QMK/VIA ANSI firmware. The original NuPhy receiver forwards the reports. With the stock keyboard firmware, use the app's Bluetooth battery support. [Download the prebuilt firmware from the latest release](https://github.com/ollycrossley/nuphy-custom-firmware/releases/latest)
 
 The Windows driver matches the receiver at `19F5:3247` and the exact USB product name `NuPhy Halo96 V2 Dongle` because other models use the same IDs. It listens to interface 1, Consumer Control usage `000C:0001`, and accepts only the battery sequence on input report ID `03`. It opens the collection read-only and sends no reports.
 
