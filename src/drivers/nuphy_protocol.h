@@ -21,10 +21,10 @@ public:
             next_ = Next::ChargingStart;
             startedMs_ = nowMs;
         } else if (usage == 0x07) {
-            charging_ = next_ == Next::ChargingStart && nowMs - startedMs_ <= 500;
+            charging_ = next_ == Next::ChargingStart && nowMs - startedMs_ <= kFrameTimeoutMs;
             next_ = Next::High;
             startedMs_ = nowMs;
-        } else if (nowMs - startedMs_ > 500) {
+        } else if (nowMs - startedMs_ > kFrameTimeoutMs) {
             next_ = Next::Start;
         } else if (next_ == Next::High && usage >= 0x08 && usage <= 0x0e) {
             percent_ = (usage - 0x08) << 4;
@@ -41,6 +41,8 @@ public:
     }
 
 private:
+    static constexpr std::uint64_t kFrameTimeoutMs = 500;
+
     enum class Next { Start, ChargingStart, High, Low, Release };
     Next next_ = Next::Start;
     std::uint64_t startedMs_ = 0;

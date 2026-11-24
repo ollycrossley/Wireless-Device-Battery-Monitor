@@ -1,5 +1,4 @@
-// NuPhy Halo96 V2 with custom battery firmware. Protocol and hardware evidence
-// are in docs/nuphy-halo96-v2.md. The stock receiver forwards the reports.
+// NuPhy Halo96 V2 battery telemetry over 2.4 GHz. See docs/nuphy-halo96-v2.md.
 #include "drivers.h"
 #include "nuphy_protocol.h"
 
@@ -89,8 +88,7 @@ private:
 }  // namespace
 
 void PollNuphyHalo96(PollContext& ctx) {
-    // The receiving thread preserves the timing of the burst without making the
-    // normal poll wait for the next 15-second broadcast, including on stock firmware.
+    // Read broadcasts in the background so polling can return the latest sample immediately.
     static std::map<std::wstring, std::unique_ptr<Receiver>> receivers;
     std::set<std::wstring> present;
     for (const auto* c : ctx.Find(kVendor, kProduct, [](const HidColl& c) {
