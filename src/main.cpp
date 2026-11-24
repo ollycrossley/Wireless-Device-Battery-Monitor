@@ -525,9 +525,12 @@ void SaveVerticalPlace(widget::VerticalPlace p) {
               : p == widget::VerticalPlace::Bottom ? 3 : 0;
     RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, L"VerticalPlace", REG_DWORD, &v, sizeof(v));
 }
-bool LoadFarLeft() { return LoadBoolSetting(L"WidgetFarLeft", false); }
-void SaveFarLeft(bool on) { SaveBoolSetting(L"WidgetFarLeft", on); }
 bool LoadBeforeApps() { return LoadBoolSetting(L"WidgetBeforeApps", false); }
+bool LoadFarLeft() {
+    const bool previousLeftSide = !LoadBeforeApps() && LoadBoolSetting(L"TaskbarPosition", false);
+    return LoadBoolSetting(L"WidgetFarLeft", previousLeftSide);
+}
+void SaveFarLeft(bool on) { SaveBoolSetting(L"WidgetFarLeft", on); }
 void SaveBeforeApps(bool on) { SaveBoolSetting(L"WidgetBeforeApps", on); }
 bool LoadBrandColors() { return LoadBoolSetting(L"BrandColors", false); }
 void SaveBrandColors(bool on) { SaveBoolSetting(L"BrandColors", on); }

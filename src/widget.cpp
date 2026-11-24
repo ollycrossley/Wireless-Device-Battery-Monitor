@@ -300,6 +300,13 @@ struct Span {
     int clockRight = 0;
     bool hasRtlTasks = false;
     int rtlTasksLeft = 0;
+    RECT bounds{};
+    UINT dpi = 0;
+    ULONGLONG sampledAt = 0;
+    bool leftMeasured = false;
+    bool hasStart = false;
+    LONG trayLeft = 0;
+    std::vector<RECT> occupied;
 };
 
 bool IsVertical(const RECT& r) { return r.bottom - r.top > r.right - r.left; }
@@ -307,8 +314,10 @@ bool IsVertical(const RECT& r) { return r.bottom - r.top > r.right - r.left; }
 int Lo(const RECT& r, bool vertical) { return vertical ? r.top : r.left; }
 int Hi(const RECT& r, bool vertical) { return vertical ? r.bottom : r.right; }
 std::vector<Span> g_spans;   // guarded by g_wbLock
-bool g_wbMirrors;            // guarded by g_wbLock: measure secondary taskbars too
-bool g_wbFarLeft;            // guarded by g_wbLock: measure the primary taskbar too (far-left spot)
+std::vector<HWND> g_wbMirrors;  // guarded by g_wbLock: selected secondary taskbars
+bool g_wbLeftSpot;            // guarded by g_wbLock
+bool g_wbPrimaryVisible = true;  // guarded by g_wbLock
+unsigned g_wbGeneration;      // guarded by g_wbLock
 
 IUIAutomationCondition* StringCondition(IUIAutomation* uia, PROPERTYID prop, const wchar_t* value) {
     VARIANT v;
@@ -321,91 +330,149 @@ IUIAutomationCondition* StringCondition(IUIAutomation* uia, PROPERTYID prop, con
     return c;
 }
 
-Span MeasureSpan(IUIAutomation* uia, HWND bar) {
-    Span s;
-    s.bar = bar;
-    RECT br{};
-    IUIAutomationElement* root = nullptr;
-    if (!GetWindowRect(bar, &br) || FAILED(uia->ElementFromHandle(bar, &root)) || !root) return s;
-    s.measured = true;
-    s.rtl = (GetWindowLongW(bar, GWL_EXSTYLE) & WS_EX_LAYOUTRTL) != 0;
-    bool v = IsVertical(br);
-    auto inBar = [&](const RECT& r) {
-        return Hi(r, v) > Lo(r, v) && Lo(r, v) >= Lo(br, v) && Hi(r, v) <= Hi(br, v);
-    };
-    if (IUIAutomationCondition* clock = StringCondition(uia, UIA_AutomationIdPropertyId, L"SystemTrayIcon")) {
-        IUIAutomationElementArray* all = nullptr;
-        int n = 0;
-        if (SUCCEEDED(root->FindAll(TreeScope_Descendants, clock, &all)) && all && SUCCEEDED(all->get_Length(&n)))
-            for (int i = 0; i < n; i++) {  // leftmost of the clock area's buttons
-                IUIAutomationElement* el = nullptr;
-                RECT r{};
-                if (SUCCEEDED(all->GetElement(i, &el)) && el && SUCCEEDED(el->get_CurrentBoundingRectangle(&r)) && inBar(r)) {
-                    if (!s.hasClock || Lo(r, v) < s.clockLeft) s.clockLeft = Lo(r, v);
-                    if (!s.hasClock || r.right > s.clockRight) s.clockRight = r.right;
-                    s.hasClock = true;
-                }
-                if (el) el->Release();
-            }
-        if (all) all->Release();
-        clock->Release();
-    }
-    if (IUIAutomationCondition* wbCond = StringCondition(uia, UIA_AutomationIdPropertyId, L"WidgetsButton")) {
-        IUIAutomationElement* wbEl = nullptr;
-        RECT r{};
-        if (SUCCEEDED(root->FindFirst(TreeScope_Descendants, wbCond, &wbEl)) && wbEl &&
-            SUCCEEDED(wbEl->get_CurrentBoundingRectangle(&r)) && inBar(r)) {
-            s.widgets = r;
-            s.hasWidgets = true;
-        }
-        if (wbEl) wbEl->Release();
-        wbCond->Release();
-    }
-    if (IUIAutomationCondition* task = StringCondition(uia, UIA_ClassNamePropertyId, L"Taskbar.TaskListButtonAutomationPeer")) {
-        IUIAutomationElementArray* all = nullptr;
-        int n = 0;
-        if (SUCCEEDED(root->FindAll(TreeScope_Descendants, task, &all)) && all && SUCCEEDED(all->get_Length(&n)))
-            for (int i = 0; i < n; i++) {
-                IUIAutomationElement* el = nullptr;
-                RECT r{};
-                if (SUCCEEDED(all->GetElement(i, &el)) && el && SUCCEEDED(el->get_CurrentBoundingRectangle(&r)) && inBar(r)) {
-                    if (!s.hasFirst || r.left < s.firstLeft) {
-                        s.firstLeft = r.left;
-                        s.hasFirst = true;
-                    }
-                    if ((!s.hasClock || Hi(r, v) <= s.clockLeft) && (!s.hasWidgets || Hi(r, v) <= Lo(s.widgets, v)) &&
-                        (!s.hasTasks || Hi(r, v) > s.tasksRight)) {
-                        s.tasksRight = Hi(r, v);
-                        s.hasTasks = true;
-                    }
-                    if (s.rtl && !v && (!s.hasClock || r.left >= s.clockRight) &&
-                        (!s.hasWidgets || r.left >= s.widgets.right) && (!s.hasRtlTasks || r.left < s.rtlTasksLeft)) {
-                        s.rtlTasksLeft = r.left;
-                        s.hasRtlTasks = true;
-                    }
-                }
-                if (el) el->Release();
-            }
-        if (all) all->Release();
-        task->Release();
-    }
-    if (IUIAutomationCondition* start = StringCondition(uia, UIA_AutomationIdPropertyId, L"StartButton")) {
-        IUIAutomationElement* el = nullptr;
-        RECT r{};
-        if (SUCCEEDED(root->FindFirst(TreeScope_Descendants, start, &el)) && el &&
-            SUCCEEDED(el->get_CurrentBoundingRectangle(&r)) && inBar(r) && (!s.hasFirst || r.left < s.firstLeft)) {
-            s.firstLeft = r.left;
-            s.hasFirst = true;
-        }
-        if (el) el->Release();
-        start->Release();
-    }
-    root->Release();
-    return s;
+bool IsXamlTaskbar(HWND bar) {
+    return FindWindowExW(bar, nullptr, kBridgeClass, nullptr) != nullptr;
 }
 
-bool IsXamlTaskbar(HWND bar) {
-    return FindWindowExW(bar, nullptr, L"Windows.UI.Composition.DesktopWindowContentBridge", nullptr) != nullptr;
+IUIAutomationCondition* SpanFilter(IUIAutomation* uia) {
+    constexpr CONTROLTYPEID types[]{
+        UIA_ButtonControlTypeId, UIA_SplitButtonControlTypeId, UIA_MenuItemControlTypeId, UIA_CheckBoxControlTypeId,
+        UIA_RadioButtonControlTypeId, UIA_ListItemControlTypeId, UIA_TabItemControlTypeId, UIA_EditControlTypeId,
+        UIA_ComboBoxControlTypeId, UIA_HyperlinkControlTypeId,
+    };
+    constexpr size_t namedCount = 4;
+    IUIAutomationCondition* conditions[namedCount + ARRAYSIZE(types)]{
+        StringCondition(uia, UIA_AutomationIdPropertyId, L"StartButton"),
+        StringCondition(uia, UIA_AutomationIdPropertyId, L"WidgetsButton"),
+        StringCondition(uia, UIA_AutomationIdPropertyId, L"SystemTrayIcon"),
+        StringCondition(uia, UIA_ClassNamePropertyId, L"Taskbar.TaskListButtonAutomationPeer"),
+    };
+    VARIANT type{};
+    type.vt = VT_I4;
+    for (size_t i = 0; i < ARRAYSIZE(types); ++i) {
+        type.lVal = types[i];
+        uia->CreatePropertyCondition(UIA_ControlTypePropertyId, type, &conditions[namedCount + i]);
+    }
+    IUIAutomationCondition* filter = nullptr;
+    if (std::all_of(std::begin(conditions), std::end(conditions), [](auto* condition) { return condition != nullptr; }))
+        uia->CreateOrConditionFromNativeArray(conditions, ARRAYSIZE(conditions), &filter);
+    for (auto* condition : conditions)
+        if (condition) condition->Release();
+    return filter;
+}
+
+IUIAutomationCacheRequest* SpanCache(IUIAutomation* uia) {
+    IUIAutomationCacheRequest* cache = nullptr;
+    if (FAILED(uia->CreateCacheRequest(&cache)) || !cache) return nullptr;
+    bool complete = SUCCEEDED(cache->put_AutomationElementMode(AutomationElementMode_None));
+    for (PROPERTYID property : { UIA_AutomationIdPropertyId, UIA_ClassNamePropertyId,
+                                 UIA_IsOffscreenPropertyId, UIA_BoundingRectanglePropertyId })
+        complete = complete && SUCCEEDED(cache->AddProperty(property));
+    if (complete) return cache;
+    cache->Release();
+    return nullptr;
+}
+
+bool AddNativeControls(Span& span, bool xaml) {
+    bool sawNativeControls = false;
+    for (HWND child = FindWindowExW(span.bar, nullptr, nullptr, nullptr); child;
+         child = FindWindowExW(span.bar, child, nullptr, nullptr)) {
+        if (!IsWindowVisible(child)) continue;
+        wchar_t cls[128]{};
+        if (!GetClassNameW(child, cls, ARRAYSIZE(cls))) return false;
+        if (wcscmp(cls, kClass) == 0 ||
+            (xaml && (wcscmp(cls, kBridgeClass) == 0 ||
+                      wcscmp(cls, L"Windows.UI.Input.InputSite.WindowClass") == 0 ||
+                      wcscmp(cls, L"ReBarWindow32") == 0)))
+            continue;
+        RECT rect{}, clipped{};
+        if (!GetWindowRect(child, &rect) || !IntersectRect(&clipped, &span.bounds, &rect)) continue;
+        if (wcscmp(cls, L"TrayNotifyWnd") == 0 || wcscmp(cls, L"ClockButton") == 0)
+            span.trayLeft = std::min(span.trayLeft, clipped.left);
+        sawNativeControls |= wcscmp(cls, L"Start") == 0 || wcscmp(cls, L"ReBarWindow32") == 0 ||
+                             wcscmp(cls, L"WorkerW") == 0 || wcscmp(cls, L"MSTaskListWClass") == 0;
+        span.occupied.push_back(clipped);
+    }
+    std::sort(span.occupied.begin(), span.occupied.end(), [](const RECT& a, const RECT& b) { return a.left < b.left; });
+    return xaml || sawNativeControls;
+}
+
+Span MeasureSpan(IUIAutomation* uia, IUIAutomationCondition* filter, IUIAutomationCacheRequest* cache,
+                 HWND bar, bool leftSpot) {
+    Span s;
+    s.bar = bar;
+    s.sampledAt = GetTickCount64();
+    if (!GetWindowRect(bar, &s.bounds) || IsRectEmpty(&s.bounds)) return s;
+    s.dpi = GetDpiForWindow(bar);
+    s.trayLeft = s.bounds.right;
+    s.rtl = (GetWindowLongW(bar, GWL_EXSTYLE) & WS_EX_LAYOUTRTL) != 0;
+    const bool v = IsVertical(s.bounds);
+    const bool measureLeft = leftSpot && !v && !s.rtl;
+    IUIAutomationElement* root = nullptr;
+    IUIAutomationElementArray* elements = nullptr;
+    int count = 0;
+    // Cache the controls and their positions in one call to Explorer.
+    bool complete = SUCCEEDED(uia->ElementFromHandle(bar, &root)) && root &&
+                    SUCCEEDED(root->FindAllBuildCache(TreeScope_Descendants, filter, cache, &elements)) &&
+                    elements && SUCCEEDED(elements->get_Length(&count));
+    if (root) root->Release();
+    std::vector<RECT> tasks;
+    for (int i = 0; complete && i < count; ++i) {
+        IUIAutomationElement* element = nullptr;
+        BOOL offscreen = TRUE;
+        complete = SUCCEEDED(elements->GetElement(i, &element)) && element &&
+                   SUCCEEDED(element->get_CachedIsOffscreen(&offscreen));
+        if (complete && !offscreen) {
+            BSTR id = nullptr, cls = nullptr;
+            RECT rect{}, clipped{};
+            complete = SUCCEEDED(element->get_CachedAutomationId(&id)) &&
+                       SUCCEEDED(element->get_CachedClassName(&cls)) &&
+                       SUCCEEDED(element->get_CachedBoundingRectangle(&rect));
+            if (complete && IntersectRect(&clipped, &s.bounds, &rect)) {
+                if (measureLeft) s.occupied.push_back(clipped);
+                const bool start = id && wcscmp(id, L"StartButton") == 0;
+                const bool task = cls && wcscmp(cls, L"Taskbar.TaskListButtonAutomationPeer") == 0;
+                s.hasStart |= start;
+                if (start || task) {
+                    s.firstLeft = s.hasFirst ? std::min(s.firstLeft, (int)clipped.left) : clipped.left;
+                    s.hasFirst = true;
+                }
+                if (task) tasks.push_back(clipped);
+                if (id && wcscmp(id, L"SystemTrayIcon") == 0) {
+                    s.clockLeft = s.hasClock ? std::min(s.clockLeft, Lo(clipped, v)) : Lo(clipped, v);
+                    s.clockRight = s.hasClock ? std::max(s.clockRight, (int)clipped.right) : clipped.right;
+                    s.hasClock = true;
+                }
+                if (id && wcscmp(id, L"WidgetsButton") == 0 && !s.hasWidgets) {
+                    s.widgets = clipped;
+                    s.hasWidgets = true;
+                }
+            }
+            SysFreeString(id);
+            SysFreeString(cls);
+        }
+        if (element) element->Release();
+    }
+    if (elements) elements->Release();
+    if (!complete) return s;
+    s.measured = true;
+    for (const RECT& task : tasks) {
+        if ((!s.hasClock || Hi(task, v) <= s.clockLeft) && (!s.hasWidgets || Hi(task, v) <= Lo(s.widgets, v)) &&
+            (!s.hasTasks || Hi(task, v) > s.tasksRight)) {
+            s.tasksRight = Hi(task, v);
+            s.hasTasks = true;
+        }
+        if (s.rtl && !v && (!s.hasClock || task.left >= s.clockRight) &&
+            (!s.hasWidgets || task.left >= s.widgets.right) && (!s.hasRtlTasks || task.left < s.rtlTasksLeft)) {
+            s.rtlTasksLeft = task.left;
+            s.hasRtlTasks = true;
+        }
+    }
+    if (measureLeft && s.hasFirst) {
+        if (s.hasClock) s.trayLeft = s.clockLeft;
+        s.leftMeasured = AddNativeControls(s, true);
+    }
+    return s;
 }
 
 // A left / right Windows 11 taskbar: the screen-y range its XAML buttons (Start, search, task buttons)
@@ -472,60 +539,68 @@ Column MeasureColumn(IUIAutomation* uia, HWND bar) {
 DWORD WINAPI WidgetsButtonThread(LPVOID) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     IUIAutomation* uia = nullptr;
+    IUIAutomationCondition* filter = nullptr;
+    IUIAutomationCacheRequest* cache = nullptr;
     IUIAutomationElement* btn = nullptr;
     HWND btnBar = nullptr;
-    bool column = false;  // vertical XAML taskbar: its task buttons come and go, so look more often
+    DWORD delay = INFINITE;
     for (;;) {
-        // No widget (tray-icon mode): sleep until one.
-        WaitForSingleObject(g_wbWake, btnBar ? (column ? 1500 : 5000) : INFINITE);
+        WaitForSingleObject(g_wbWake, delay);
         AcquireSRWLockShared(&g_wbLock);
         HWND bar = g_wbTaskbar;
+        const auto mirrors = g_wbMirrors;
+        const bool primaryVisible = g_wbPrimaryVisible, leftSpot = g_wbLeftSpot;
+        const unsigned generation = g_wbGeneration;
         ReleaseSRWLockShared(&g_wbLock);
-        if (btn && bar != btnBar) { btn->Release(); btn = nullptr; }
-        btnBar = bar;
+        const HWND primary = primaryVisible && bar && IsWindow(bar) ? bar : nullptr;
+        if (btn && primary != btnBar) { btn->Release(); btn = nullptr; }
+        btnBar = primary;
         RECT r{};
-        if (bar && IsWindow(bar)) {
-            if (!uia)
-                CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER, __uuidof(IUIAutomation), (void**)&uia);
-            if (uia && !btn) {
+        if (bar && !uia)
+            CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER, __uuidof(IUIAutomation), (void**)&uia);
+        if (primary && uia) {
+            if (!btn) {
                 IUIAutomationElement* root = nullptr;
-                IUIAutomationCondition* cond = nullptr;
-                VARIANT id;
-                VariantInit(&id);
-                id.vt = VT_BSTR;
-                id.bstrVal = SysAllocString(L"WidgetsButton");
-                if (SUCCEEDED(uia->ElementFromHandle(bar, &root)) && root &&
-                    SUCCEEDED(uia->CreatePropertyCondition(UIA_AutomationIdPropertyId, id, &cond)) && cond)
-                    root->FindFirst(TreeScope_Descendants, cond, &btn);
-                VariantClear(&id);
-                if (cond) cond->Release();
-                if (root) root->Release();
+                if (SUCCEEDED(uia->ElementFromHandle(primary, &root)) && root) {
+                    if (auto* cond = StringCondition(uia, UIA_AutomationIdPropertyId, L"WidgetsButton")) {
+                        root->FindFirst(TreeScope_Descendants, cond, &btn);
+                        cond->Release();
+                    }
+                    root->Release();
+                }
             }
             if (btn && FAILED(btn->get_CurrentBoundingRectangle(&r))) {
-                btn->Release();  // stale (Widgets turned off, Explorer restarted): look it up again next time
+                btn->Release();
                 btn = nullptr;
                 r = {};
             }
         }
-        AcquireSRWLockShared(&g_wbLock);
-        bool mirrors = g_wbMirrors, farLeft = g_wbFarLeft;
-        ReleaseSRWLockShared(&g_wbLock);
         std::vector<Span> spans;
-        if (bar && farLeft && uia && IsWindow(bar) && IsXamlTaskbar(bar)) spans.push_back(MeasureSpan(uia, bar));
-        if (bar && mirrors && uia)
-            for (HWND t = FindWindowExW(nullptr, nullptr, L"Shell_SecondaryTrayWnd", nullptr); t;
-                 t = FindWindowExW(nullptr, t, L"Shell_SecondaryTrayWnd", nullptr))
-                if (IsXamlTaskbar(t)) spans.push_back(MeasureSpan(uia, t));  // Windows 10 bars have real child windows
-        Column col;
-        column = bar && uia && IsWindow(bar) && IsVerticalBar(bar) && IsXamlTaskbar(bar);
-        if (column) col = MeasureColumn(uia, bar);
-        AcquireSRWLockExclusive(&g_wbLock);
-        g_column = col;
-        if (bar && g_wbTaskbar == bar) {  // drop a result for a taskbar we no longer sit on
-            g_wbRect = r;
-            g_wbRectBar = bar;
+        if (bar && uia && ((leftSpot && primary) || !mirrors.empty())) {
+            if (!filter) filter = SpanFilter(uia);
+            if (!cache) cache = SpanCache(uia);
+            if (filter && cache) {
+                if (leftSpot && primary && IsXamlTaskbar(primary))
+                    spans.push_back(MeasureSpan(uia, filter, cache, primary, true));
+                for (HWND mirror : mirrors)
+                    if (IsXamlTaskbar(mirror)) spans.push_back(MeasureSpan(uia, filter, cache, mirror, leftSpot));
+            }
         }
-        g_spans = std::move(spans);
+        Column col;
+        const bool column = primary && uia && IsVerticalBar(primary) && IsXamlTaskbar(primary);
+        if (column) col = MeasureColumn(uia, primary);
+        delay = bar ? 5000 : INFINITE;
+        if (leftSpot && !spans.empty()) delay = spans.size() > 1 ? 1000 : 2000;
+        if (column) delay = std::min<DWORD>(delay, 1500);
+        AcquireSRWLockExclusive(&g_wbLock);
+        if (generation == g_wbGeneration) {
+            g_column = col;
+            if (bar) {
+                g_wbRect = r;
+                g_wbRectBar = bar;
+            }
+            g_spans = std::move(spans);
+        }
         ReleaseSRWLockExclusive(&g_wbLock);
     }
 }
@@ -536,6 +611,13 @@ DWORD WINAPI WidgetsButtonThread(LPVOID) {
 void WatchWidgetsButton(HWND taskbar) {
     AcquireSRWLockExclusive(&g_wbLock);
     g_wbTaskbar = taskbar;
+    ++g_wbGeneration;
+    g_spans.clear();
+    g_column = {};
+    if (!taskbar) {
+        g_wbMirrors.clear();
+        g_wbPrimaryVisible = true;
+    }
     ReleaseSRWLockExclusive(&g_wbLock);
     if (!g_wbWake) {
         g_wbWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -553,40 +635,63 @@ RECT WidgetsButtonRect() {
     return r;
 }
 
-// Screen x for a strip `width` wide at the left end of a Windows 11 taskbar, right of the Widgets button
-// when that sits there (centred taskbar). False while the taskbar is not measured yet, or when the Start or
-// task buttons reach into the spot (left-aligned taskbar, many open windows): the strip then stays next to
-// the clock rather than cover a button.
+bool FindLeftSlot(const Span& span, LONG width, LONG pad, int& x) {
+    LONG left = span.bounds.left + pad;
+    const LONG right = span.trayLeft - pad;
+    for (const auto& rect : span.occupied) {
+        if (left + width <= rect.left - pad) break;
+        left = std::max(left, rect.right + pad);
+    }
+    if (left + width > right) return false;
+    x = left;
+    return true;
+}
+
+bool FindBeforeAppsSlot(const Span& span, LONG width, LONG pad, int& x) {
+    LONG edge = span.firstLeft;
+    if (span.hasWidgets && span.widgets.right <= edge && span.widgets.right + pad >= edge - width - pad)
+        edge = span.widgets.left;
+    const LONG left = edge - width - pad;
+    if (left < span.bounds.left + pad || left + width > span.trayLeft - pad ||
+        std::any_of(span.occupied.begin(), span.occupied.end(), [&](const RECT& rect) {
+            return rect.left - pad < left + width && rect.right + pad > left;
+        }))
+        return false;
+    x = left;
+    return true;
+}
+
+// Use fresh measurements for horizontal left-side placement and let callers handle the tray position.
 bool FarLeftX(HWND bar, int width, int& x) {
-    RECT br{};
-    if (width <= 0 || !GetWindowRect(bar, &br)) return false;
-    bool ok = false;
+    RECT bounds{};
+    if (width <= 0 || !GetWindowRect(bar, &bounds) || IsRectEmpty(&bounds) || IsVertical(bounds) ||
+        (GetWindowLongW(bar, GWL_EXSTYLE) & WS_EX_LAYOUTRTL))
+        return false;
+    const UINT dpi = GetDpiForWindow(bar);
+    if (!dpi) return false;
+    const LONG pad = MulDiv(4, dpi, 96);
+    if (!IsXamlTaskbar(bar)) {
+        if (g_beforeApps) return false;
+        Span span;
+        span.bar = bar;
+        span.bounds = bounds;
+        span.trayLeft = bounds.right;
+        return AddNativeControls(span, false) && FindLeftSlot(span, width, pad, x);
+    }
+
+    bool placed = false;
+    const ULONGLONG now = GetTickCount64();
+    constexpr ULONGLONG sampleLifetimeMs = 3500;
     AcquireSRWLockShared(&g_wbLock);
-    for (const auto& s : g_spans)
-        if (s.bar == bar && s.measured && s.hasFirst && g_beforeApps) {
-            // Right next to the taskbar apps (PR #760): just left of Start, or left of the Widgets button
-            // when that sits between the free space and Start. Needs room between the bar's edge and them.
-            int edge = s.firstLeft;
-            if (s.hasWidgets && s.widgets.right <= s.firstLeft && s.widgets.right + Px(4) >= s.firstLeft - width - Px(4))
-                edge = s.widgets.left;
-            x = edge - width - Px(4);
-            ok = x >= br.left + Px(4);
-        } else if (s.bar == bar && s.measured && s.hasFirst) {
-            x = br.left + Px(4);
-            if (s.hasWidgets && s.widgets.left < x + width + Px(4) && s.widgets.right > x) x = s.widgets.right + Px(4);
-            ok = x + width + Px(4) <= s.firstLeft;
-            if (!ok && s.hasTasks) {
-                // No room before Start (left-aligned taskbar, from PR #2519): take the first free spot from the
-                // left instead, right after the task buttons, as long as it stays clear of the Widgets button
-                // and the clock. Only when that does not fit either does the strip go back next to the clock.
-                x = s.tasksRight + Px(4);
-                int limit = s.hasClock ? s.clockLeft : (int)br.right;
-                if (s.hasWidgets && s.widgets.left >= x) limit = std::min(limit, (int)s.widgets.left);
-                ok = x + width + Px(4) <= limit;
-            }
-        }
+    for (const auto& span : g_spans) {
+        if (span.bar != bar || !span.leftMeasured || (bar == g_taskbar && !span.hasStart) ||
+            span.dpi != dpi || !EqualRect(&span.bounds, &bounds) || now - span.sampledAt > sampleLifetimeMs)
+            continue;
+        placed = g_beforeApps ? FindBeforeAppsSlot(span, width, pad, x) : FindLeftSlot(span, width, pad, x);
+        break;
+    }
     ReleaseSRWLockShared(&g_wbLock);
-    return ok;
+    return placed;
 }
 
 void ApplyTipTheme() {
@@ -1293,12 +1398,20 @@ void DestroyMirror(Mirror& m) {
     m.wnd = nullptr;
 }
 
-void SetMeasureMirrors(bool on) {
+void SyncLayoutWatch() {
     AcquireSRWLockExclusive(&g_wbLock);
-    bool changed = g_wbMirrors != on;
-    g_wbMirrors = on;
+    const bool primaryVisible = !g_primaryHidden;
+    const bool changed = g_wbPrimaryVisible != primaryVisible ||
+                         !std::equal(g_wbMirrors.begin(), g_wbMirrors.end(), g_mirrors.begin(), g_mirrors.end(),
+                                     [](HWND bar, const Mirror& mirror) { return bar == mirror.bar; });
+    if (changed) {
+        g_wbPrimaryVisible = primaryVisible;
+        g_wbMirrors.clear();
+        for (const auto& mirror : g_mirrors) g_wbMirrors.push_back(mirror.bar);
+        ++g_wbGeneration;
+    }
     ReleaseSRWLockExclusive(&g_wbLock);
-    if (changed && on && g_wbWake) SetEvent(g_wbWake);  // measure the new taskbar now, not in 5 s
+    if (changed && g_wbWake) SetEvent(g_wbWake);
 }
 
 std::vector<HWND> SecondaryTaskbars() {
@@ -1405,7 +1518,7 @@ void SyncMirrors() {
         g_mirrors.push_back(m);
         PaintMirror(g_mirrors.back());
     }
-    SetMeasureMirrors(!g_mirrors.empty());
+    SyncLayoutWatch();
     for (auto& m : g_mirrors) PositionMirror(m);
 }
 
@@ -2014,7 +2127,6 @@ void Destroy() {
     g_fill = false;
     for (auto& m : g_mirrors) DestroyMirror(m);
     g_mirrors.clear();
-    SetMeasureMirrors(false);
     g_primaryHidden = false;  // the next Create() decides again
     if (g_wbWake) WatchWidgetsButton(nullptr);
     if (g_card) { DestroyWindow(g_card); g_card = nullptr; }
@@ -2148,9 +2260,12 @@ bool Vertical() { return g_wnd && g_vertical; }
 void ApplyLeftSpot() {
     bool on = g_farLeft || g_beforeApps;
     AcquireSRWLockExclusive(&g_wbLock);
-    g_wbFarLeft = on;  // measure the primary taskbar too
+    if (g_wbLeftSpot != on) {
+        g_wbLeftSpot = on;
+        ++g_wbGeneration;
+    }
     ReleaseSRWLockExclusive(&g_wbLock);
-    if (on && g_wbWake) SetEvent(g_wbWake);  // measure the taskbar now, not in 5 s
+    if (g_wbWake) SetEvent(g_wbWake);
     if (g_wnd) Reposition();
 }
 
